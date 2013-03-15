@@ -2458,6 +2458,26 @@ config FB_PUV3_UNIGFX
 	  Choose this option if you want to use the Unigfx device as a
 	  framebuffer device. Without the support of PCI & AGP.
 
+config FB_HUB12
+	tristate "HUB12 based LED panel framebuffer support"
+	depends on FB
+	select FB_CFB_FILLRECT
+	select FB_CFB_COPYAREA
+	select FB_CFB_IMAGEBLIT
+	select FB_BACKLIGHT if FB_HUB12_BACKLIGHT
+	help
+	  Provides support for driving arrays of HUB12 based monochrome
+	  LED panels.  Requires use of SPI port and 4 gpios.
+
+config FB_HUB12_BACKLIGHT
+	bool "Support for backlight control"
+	depends on FB_HUB12
+	default y
+	help
+	  Say Y here if you want to control the brightness of the
+	  LED panel array.
+
+
 source "drivers/video/omap/Kconfig"
 source "drivers/video/omap2/Kconfig"
 source "drivers/video/exynos/Kconfig"
