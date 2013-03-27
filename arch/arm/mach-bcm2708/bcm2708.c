@@ -64,6 +64,10 @@
 #include <linux/broadcom/vc_cma.h>
 #endif
 
+#ifdef CONFIG_FB_HUB12
+#include <video/hub12fb.h>
+#endif
+
 
 /* Effectively we have an IOMMU (ARM<->VideoCore map) that is set up to
  * give us IO access only to 64Mbytes of physical memory (26 bits).  We could
@@ -578,6 +582,22 @@ static struct resource bcm2708_spi_resources[] = {
 	}
 };
 
+
+#ifdef CONFIG_FB_HUB12
+static struct hub12fb_platform_data hub12fb_pdata = {
+	.gpio = {
+		.enable = 18,
+		.latch  = 17,
+		.a      = 22,
+		.b      = 27,
+	},
+	.width      = 32,
+	.height     = 32,
+	.refresh    = 60,
+	.brightness = 30,
+};
+#endif
+
 static struct platform_device bcm2708_spi_device = {
 	.name = "bcm2708_spi",
 	.id = 0,
@@ -585,15 +605,28 @@ static struct platform_device bcm2708_spi_device = {
 	.resource = bcm2708_spi_resources,
 };
 
+
 #ifdef CONFIG_SPI
 static struct spi_board_info bcm2708_spi_devices[] = {
+#ifdef CONFIG_FB_HUB12
+	{
+		.modalias = "hub12fb",
+		.platform_data = &hub12fb_pdata,
+		.max_speed_hz = 5000000,
+		.bus_num = 0,
+		.chip_select = 0,
+		.mode = SPI_MODE_0,
+	},
+#else
 	{
 		.modalias = "spidev",
 		.max_speed_hz = 500000,
 		.bus_num = 0,
 		.chip_select = 0,
 		.mode = SPI_MODE_0,
-	}, {
+	},
+#endif
+	{
 		.modalias = "spidev",
 		.max_speed_hz = 500000,
 		.bus_num = 0,
