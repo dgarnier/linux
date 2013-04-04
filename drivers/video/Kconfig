@@ -2461,9 +2461,10 @@ config FB_PUV3_UNIGFX
 config FB_HUB12
 	tristate "HUB12 based LED panel framebuffer support"
 	depends on FB
-	select FB_CFB_FILLRECT
-	select FB_CFB_COPYAREA
-	select FB_CFB_IMAGEBLIT
+	select FB_SYS_FILLRECT
+	select FB_SYS_COPYAREA
+	select FB_SYS_IMAGEBLIT
+	select FB_SYS_FOPS
 	select FB_BACKLIGHT if FB_HUB12_BACKLIGHT
 	help
 	  Provides support for driving arrays of HUB12 based monochrome

@@ -21,6 +21,8 @@
 #include <linux/delay.h>
 #include <linux/fb.h>
 #include <linux/init.h>
+#include <linux/vmalloc.h>
+#include <linux/gfp.h>
 
 #include <linux/gpio.h>
 #include <linux/spi/spi.h>
@@ -28,7 +30,7 @@
 #include <linux/hrtimer.h>
 #include <linux/backlight.h>
 
-#include <video/hub12fb.h>
+#include <linux/spi/hub12fb.h>
 
 /*
  * Driver data
@@ -36,26 +38,27 @@
 
 #define DRIVER_NAME HUB12FB_MODALIAS
 
+#define HUB12_MAX_FREQ 7500000
+
 struct hub12_par {
 	struct hub12fb_platform_data	pdata;
 	struct spi_device *		spi;
 	struct fb_info *		info;
 	void *				fb_buffer;
+	size_t				bsize;
 	void *				hsync_buf[4];
 	dma_addr_t			hsync_dma[4];
 	unsigned			hsync_length;
 	struct spi_message		message;
 	struct spi_transfer		transfer;
-	wait_queue_head_t		vsync_wait;
+	struct completion		hsync_done;
 	struct hrtimer			hsync_timer;
 	struct hrtimer			ledon_timer;
 	ktime_t				hsync_period;
 	ktime_t				ledon_period;
-	int				vsync_timeout;
+	int				hsync_timeout;
 	int				blank;
 	unsigned			running       :1;
-	unsigned			hsync_running :1;
-	unsigned			vsync_flag    :1;
 	int				i_scan;
 	u32				pseudo_palette[16];
 };
@@ -70,57 +73,29 @@ static const struct hub12fb_platform_data default_platform_data = {
 	.width      = 32,
 	.height     = 16,
 	.refresh    = 60,
-	.brightness = 128,
+	.bpp	    = 1,
+	.brightness = 10,
 };
 
 static struct spi_board_info board_info = {
 	.modalias	= HUB12FB_MODALIAS,
 	.platform_data	= &default_platform_data,
 	.mode		= SPI_MODE_0,
-	.max_speed_hz	= 8000000,
+	.max_speed_hz	= HUB12_MAX_FREQ,
 	.bus_num	= 0,
 	.chip_select	= 0,
 };
 
+#define DECLARE_HUB12_MODE(hz, nx, ny) \
+	{ .xres = 32*nx, .yres = 16*ny, .refresh=hz, \
+	.pixclock = 1000 * KHZ2PICOS(512 * hz * nx * ny) }
 
-/* test pattern .. lsb format
- *
- * 0***1***2***3***4***5***6***7***  = FF FF FF FF
- * **              **            **  = 30 00 30 0C
- * * *       **    * *          * *  = 50 C0 50 0A
- * *  *     *  *   *  *        *  *  = 90 21 90 09
- * 4   *     **    *   *      *   *  = 11 C0 11 88
- * *    *          *    *    *    *  = 12 00 12 48
- * *     *         *     *  *     *  = 14 00 14 28
- * *      *        *      **      *  = 18 00 18 18
- * 8       *       *      **      *  = 10 10 18 18
- * *    *   *      *     *  *     *  = 12 20 14 28
- * *   * *   *     *    *  * *    *  = 15 40 12 58
- * *  *   *   *    *   *  **  *   *  = 98 80 19 98
- * C   * *     *   *  *    *   *  *  = 15 01 90 19
- * *    *       *  * *     *    * *  = 12 02 50 1A
- * *             * **     ***    **  = 10 01 38 3C
- * F*** ***  **   *******     *****  = FE C8 F3 1F
- *
- */
-
-static const char test_pattern_32_16[64] = {
-	0xFF, 0xFF, 0xFF, 0xFF,
-	0x30, 0x00, 0x30, 0x0C,
-	0x50, 0xC0, 0x50, 0x0A,
-	0x90, 0x21, 0x90, 0x09,
-	0x11, 0xC0, 0x11, 0x88,
-	0x12, 0x00, 0x12, 0x48,
-	0x14, 0x00, 0x14, 0x28,
-	0x18, 0x00, 0x18, 0x18,
-	0x10, 0x10, 0x18, 0x18,
-	0x12, 0x20, 0x14, 0x28,
-	0x15, 0x40, 0x12, 0x58,
-	0x98, 0x80, 0x19, 0x98,
-	0x15, 0x01, 0x90, 0x19,
-	0x12, 0x02, 0x50, 0x1A,
-	0x10, 0x01, 0x38, 0x3C,
-	0xFE, 0xC8, 0xF3, 0x1F,
+static const struct fb_videomode hub12fb_modes[] = {
+	DECLARE_HUB12_MODE(60,1,1), DECLARE_HUB12_MODE(100,1,1),
+	DECLARE_HUB12_MODE(60,2,1), DECLARE_HUB12_MODE(60,1,2),
+	DECLARE_HUB12_MODE(60,2,2), DECLARE_HUB12_MODE(60,2,2),
+	DECLARE_HUB12_MODE(60,3,2), DECLARE_HUB12_MODE(60,4,2),
+	DECLARE_HUB12_MODE(60,5,2), DECLARE_HUB12_MODE(60,6,2)
 };
 
 /*
@@ -138,9 +113,70 @@ static const struct fb_fix_screeninfo hub12fb_fix __devinitconst = {
 	.accel =	FB_ACCEL_NONE,
 };
 
-static char	*mode	__devinitdata = NULL;
-static int	spi[3]  __devinitdata = {-1,0,8000000}; /* no default bus */
-static int	gpio[4]	__devinitdata = {-1,-1,-1,-1}; /* overrides if not -1 */
+static const u32 hub12fb_info_flags = FBINFO_DEFAULT | FBINFO_READS_FAST |
+		FBINFO_VIRTFB | FBINFO_HWACCEL_IMAGEBLIT | FBINFO_HWACCEL_FILLRECT |
+		FBINFO_HWACCEL_COPYAREA;
+
+
+static char *mode __devinitdata = NULL;
+static int spi[3] __devinitdata = {-1,0,HUB12_MAX_FREQ}; /* no default bus */
+static int gpio[4] __devinitdata = {-1,-1,-1,-1}; /* overrides if not -1 */
+
+static u16 red2[]   __read_mostly = { 0x0000, 0xFFFF};
+static u16 green2[] __read_mostly = { 0x0000, 0x0000};
+static u16 blue2[]  __read_mostly = { 0x0000, 0x0000};
+static const struct fb_cmap hub12fb_cmap_2_colors = {
+    .len=2, .red=red2, .green=green2, .blue=blue2
+};
+
+static const u8 palette_1bit[256] = {[0]=1,[1]=0};
+
+/*
+ * def bitreverse(x):
+ *     x = ((x & 0xaa)>>1) | ((x & 0x55)<<1)
+ *     x = ((x & 0xcc)>>2) | ((x & 0x33)<<2)
+ *     x = ((x & 0xf0)>>4) | ((x & 0x0f)<<4)
+ *     return x
+ */
+
+static const unsigned char bit_reverse_inverse[] = {
+	0xff, 0x7f, 0xbf, 0x3f, 0xdf, 0x5f, 0x9f, 0x1f,
+	0xef, 0x6f, 0xaf, 0x2f, 0xcf, 0x4f, 0x8f, 0x0f,
+	0xf7, 0x77, 0xb7, 0x37, 0xd7, 0x57, 0x97, 0x17,
+	0xe7, 0x67, 0xa7, 0x27, 0xc7, 0x47, 0x87, 0x07,
+	0xfb, 0x7b, 0xbb, 0x3b, 0xdb, 0x5b, 0x9b, 0x1b,
+	0xeb, 0x6b, 0xab, 0x2b, 0xcb, 0x4b, 0x8b, 0x0b,
+	0xf3, 0x73, 0xb3, 0x33, 0xd3, 0x53, 0x93, 0x13,
+	0xe3, 0x63, 0xa3, 0x23, 0xc3, 0x43, 0x83, 0x03,
+	0xfd, 0x7d, 0xbd, 0x3d, 0xdd, 0x5d, 0x9d, 0x1d,
+	0xed, 0x6d, 0xad, 0x2d, 0xcd, 0x4d, 0x8d, 0x0d,
+	0xf5, 0x75, 0xb5, 0x35, 0xd5, 0x55, 0x95, 0x15,
+	0xe5, 0x65, 0xa5, 0x25, 0xc5, 0x45, 0x85, 0x05,
+	0xf9, 0x79, 0xb9, 0x39, 0xd9, 0x59, 0x99, 0x19,
+	0xe9, 0x69, 0xa9, 0x29, 0xc9, 0x49, 0x89, 0x09,
+	0xf1, 0x71, 0xb1, 0x31, 0xd1, 0x51, 0x91, 0x11,
+	0xe1, 0x61, 0xa1, 0x21, 0xc1, 0x41, 0x81, 0x01,
+	0xfe, 0x7e, 0xbe, 0x3e, 0xde, 0x5e, 0x9e, 0x1e,
+	0xee, 0x6e, 0xae, 0x2e, 0xce, 0x4e, 0x8e, 0x0e,
+	0xf6, 0x76, 0xb6, 0x36, 0xd6, 0x56, 0x96, 0x16,
+	0xe6, 0x66, 0xa6, 0x26, 0xc6, 0x46, 0x86, 0x06,
+	0xfa, 0x7a, 0xba, 0x3a, 0xda, 0x5a, 0x9a, 0x1a,
+	0xea, 0x6a, 0xaa, 0x2a, 0xca, 0x4a, 0x8a, 0x0a,
+	0xf2, 0x72, 0xb2, 0x32, 0xd2, 0x52, 0x92, 0x12,
+	0xe2, 0x62, 0xa2, 0x22, 0xc2, 0x42, 0x82, 0x02,
+	0xfc, 0x7c, 0xbc, 0x3c, 0xdc, 0x5c, 0x9c, 0x1c,
+	0xec, 0x6c, 0xac, 0x2c, 0xcc, 0x4c, 0x8c, 0x0c,
+	0xf4, 0x74, 0xb4, 0x34, 0xd4, 0x54, 0x94, 0x14,
+	0xe4, 0x64, 0xa4, 0x24, 0xc4, 0x44, 0x84, 0x04,
+	0xf8, 0x78, 0xb8, 0x38, 0xd8, 0x58, 0x98, 0x18,
+	0xe8, 0x68, 0xa8, 0x28, 0xc8, 0x48, 0x88, 0x08,
+	0xf0, 0x70, 0xb0, 0x30, 0xd0, 0x50, 0x90, 0x10,
+	0xe0, 0x60, 0xa0, 0x20, 0xc0, 0x40, 0x80, 0x00
+};
+
+/* ---------------------------------------------------------------------------
+ * Backlight driver
+ */
 
 static inline void hub12fb_set_brightness(struct hub12_par *par)
 {
@@ -148,8 +184,9 @@ static inline void hub12fb_set_brightness(struct hub12_par *par)
 
 	ns = par->pdata.brightness * ktime_to_ns(par->hsync_period) / 256;
 
-	// should have some reasonable min and max here
-	// and the change the run mode if you are outside those ranges...
+	/* should have some reasonable min and max here
+	 * and the change the run mode if you are outside those ranges...
+	 */
 
 	par->ledon_period = ns_to_ktime(ns);
 }
@@ -233,28 +270,9 @@ static void exit_hub12bl(struct fb_info *info)
 
 #endif
 
-static int wait_for_vsync(struct hub12_par *par)
-{
-	int ret;
-
-	/*
-	 * slight race condition might mean have to wait for second vsync
-	 */
-
-	par->vsync_flag = 0;
-	ret = wait_event_interruptible_timeout(par->vsync_wait,
-					       par->vsync_flag != 0,
-					       par->vsync_timeout);
-	if (ret < 0)
-		return ret;
-
-	if (ret == 0) {
-		printk(KERN_ALERT DRIVER_NAME " wait for vsync timed out.\n");
-		return -ETIMEDOUT;
-	}
-
-	return 0;
-}
+/* ---------------------------------------------------------------------------
+ *  Framebuffer driver loop
+ */
 
 /*
  * do_vsync breaks up the framebuffer into the
@@ -265,39 +283,78 @@ static int wait_for_vsync(struct hub12_par *par)
  *  i, 4 "scan lines"
  *  j, height / 16 "module rows"
  *  k, width / 8 "columes per row"
- *  l, 4 lines per colume (per scanline)
+ *  l, 4 lines per column (per scanline, bottom up!)
  */
+
+/* some spi masters can write lsb mode, so in the future
+ * one could implement a different transfer mode
+ * and not use the bit reverse table
+ */
+
+#define CONVERT(byte)	bit_reverse_inverse[byte]
+
+static void inline load_interlace_1bit(u8 *lb, u8 *fb, u8 lace,
+					u16 width, u16 height)
+{
+	int j, k, l, rowbytes = width/8;
+	/*
+	* iterates in direction of output stream...
+	* copy the data, 8 pixel byte by byte, need bitswap for SPI
+	* (lsb first spi driver is rare)
+	*/
+
+	for (j=0; j<height/16; j++)
+		for (k=0; k<rowbytes; k++)
+			for (l=3; l>=0; l--)
+				*lb++ = CONVERT(fb[rowbytes*(j*16+l*4+lace) + k]);
+}
+
+
+
+static void inline load_interlace_pseudo_8bit(u8 *lb, u8 *fb, u8 lace,
+					 u16 width, u16 height, const u8 *palette)
+{
+	int j, k, l, rowbytes= width/8;
+	u8 *px;
+	u8 byte;
+	/* same loop as 1 bit, but build byte from 8 pixels with palette */
+
+	for (j=0; j<height/16; j++)
+		for (k=0; k<rowbytes; k++)
+			for (l=3; l>=0; l--) {
+				px = fb + width * (j*16+l*4+lace) + k*8;
+				byte  = palette[*px++] << 7;
+				byte |= palette[*px++] << 6;
+				byte |= palette[*px++] << 5;
+				byte |= palette[*px++] << 4;
+				byte |= palette[*px++] << 3;
+				byte |= palette[*px++] << 2;
+				byte |= palette[*px++] << 1;
+				byte |= palette[*px++];
+				*lb++ = byte;
+			}
+}
 
 static void do_vsync(struct hub12_par *par)
 {
-	u16 i,j,k,l;
-	u16 rowbytes = par->pdata.width/8;
+	s16 i;
 
-	u8 *fb = par->fb_buffer;
-	u8 *lb;
-
-	/* copy the data, byte by byte */
-	/* might need bitswap for SPI */
-
-	for(i=0;i<4;i++) {
-		lb = par->hsync_buf[i];
-		for (j=0;j<par->pdata.height/16;j++)
-			for(k=0;k<rowbytes;k++)
-				for(l=0;l<4;l++)
-					*lb++ = fb[(j*16+l*4+i)*rowbytes + k];
-	}
+	for(i=0;i<4;i++)
+		if (par->pdata.bpp == 1)
+			load_interlace_1bit(par->hsync_buf[i], par->fb_buffer, i,
+				par->pdata.width, par->pdata.height);
+		else
+			load_interlace_pseudo_8bit(par->hsync_buf[i], par->fb_buffer, i,
+				par->pdata.width, par->pdata.height, palette_1bit);
 	par->i_scan = 0;
-	par->vsync_flag = 1;
-	if (waitqueue_active(&par->vsync_wait))
-		wake_up_interruptible(&par->vsync_wait);
 }
 
 static void shift_scanline_completion(void *context)
 {
 	/* run after the spi transfer is complete */
 
-	static const int avals[4] = {0,0,1,1};
-	static const int bvals[4] = {0,1,0,1};
+	static const int avals[4] = {0,1,0,1};
+	static const int bvals[4] = {0,0,1,1};
 
 	struct hub12_par *par = (struct hub12_par *) context;
 
@@ -320,7 +377,7 @@ static void shift_scanline_completion(void *context)
 	if (par->i_scan == 4) 	/* do the vsync now */
 		do_vsync(par);
 
-	par->hsync_running = 0;
+	complete(&par->hsync_done);
 }
 
 
@@ -333,8 +390,6 @@ static void setup_hsync(struct hub12_par *par)
 
 	struct spi_message *m = &par->message;
 	struct spi_transfer *t = &par->transfer;
-
-	par->hsync_running = 0;
 
 	t->rx_buf = NULL;
 	t->rx_dma = 0;
@@ -350,25 +405,16 @@ static void setup_hsync(struct hub12_par *par)
 
 	m->context = par;
 	m->complete = shift_scanline_completion;
+
+	/* mark our completion done so we can start again */
+	init_completion(&par->hsync_done);
+	complete(&par->hsync_done);
 }
 
 static void shift_scanline_start(struct hub12_par *par)
 {
 	struct spi_message *m = &par->message;
 	struct spi_transfer *t = &par->transfer;
-
-	/* sometimes the last transfer can still be running!
-	 * this happens on the RPi because the SPI master can take
-	 * up to 10msec to respond sometimes
-	 *
-	 * we just stop here and it gets tried again on
-	 * the next go around.
-	 */
-
-	if (par->hsync_running)
-		return;
-
-	par->hsync_running = 1;
 
 	t->tx_buf = par->hsync_buf[par->i_scan];
 	t->tx_dma = par->hsync_dma[par->i_scan];
@@ -399,16 +445,23 @@ static enum hrtimer_restart do_hsync(struct hrtimer *timer)
 
 	/* no more hsync */
 	if (!par->running) {
-		par->vsync_flag = 1;
-		if (waitqueue_active(&par->vsync_wait))
-			wake_up_interruptible(&par->vsync_wait);
 		/* signal vsync in case of waiters... */
 		return HRTIMER_NORESTART;
 	}
 
-	shift_scanline_start(par);
+	/* sometimes the last transfer can still be running!
+	 * this happens on the RPi because the SPI master can take
+	 * up to 10msec to respond sometimes
+	 *
+	 * we will just skip the transfer and wait for the next
+	 * go around if we weren't "done"
+	 *
+	 * if last hsync was complete, eat the done and start anew
+	 */
 
-	/* having trouble with this... */
+	if (try_wait_for_completion(&par->hsync_done))
+		shift_scanline_start(par);
+
 	/* really shift it forward */
 	hrtimer_add_expires(timer, par->hsync_period);
 	/* in case it fell to far behind */
@@ -418,17 +471,26 @@ static enum hrtimer_restart do_hsync(struct hrtimer *timer)
 
 static void hub12fb_stop_running(struct hub12_par *par)
 {
-	if (par->running) {
-		par->running = 0;
-		/* will sleep until hsync is stopped */
-		hrtimer_cancel(&par->hsync_timer);
-		hrtimer_cancel(&par->ledon_timer);
-		/* this might be all we need..
-		 * but I seem to be leaving dross in the
-		 * process list
-		 */
-		wait_for_vsync(par);
-	}
+	if (!par->running)
+		return;
+
+	par->running = 0;
+	/* will sleep until hsync is stopped */
+	hrtimer_cancel(&par->hsync_timer);
+
+	/* in the chance a shift was already started */
+	wait_for_completion_interruptible_timeout(&par->hsync_done,
+						  par->hsync_timeout);
+
+	/* lets also make sure the enable is off */
+	hrtimer_cancel(&par->ledon_timer);
+	gpio_set_value(par->pdata.gpio.enable, 0);
+
+	/* shutdown other gpio */
+	gpio_set_value(par->pdata.gpio.a, 0);
+	gpio_set_value(par->pdata.gpio.b, 0);
+	gpio_set_value(par->pdata.gpio.latch, 0);
+
 }
 
 static void hub12fb_start_running(struct hub12_par *par)
@@ -438,7 +500,6 @@ static void hub12fb_start_running(struct hub12_par *par)
 
 	/* begin with vsync */
 	do_vsync(par);
-
 	setup_hsync(par);
 
 	par->running = 1;
@@ -459,68 +520,6 @@ static inline u32 hub12fb_refresh_rate(struct fb_var_screeninfo *var)
 	return refresh;
 }
 
-static int hub12fb_modestr_to_var(const char *mode_option,
-				  struct fb_var_screeninfo *var)
-{
-	/* parseing section borrowed form modedb.c */
-	int i;
-	const char *name;
-	unsigned int namelen;
-	int res_specified = 0, refresh_specified = 0;
-	int yres_specified = 0;
-	unsigned int xres = 32, yres = 16, refresh = 60;
-
-	if (!mode_option)
-		mode_option = "32x32@60";
-
-	name = mode_option;
-	namelen = strlen(name);
-
-	for (i = namelen-1; i >= 0; i--) {
-		switch (name[i]) {
-		case '@':
-			namelen = i;
-			if (!refresh_specified && !yres_specified) {
-				refresh = simple_strtol(&name[i+1], NULL,
-							10);
-				refresh_specified = 1;
-			} else
-				goto done;
-			break;
-		case 'x':
-			if (!yres_specified) {
-				yres = simple_strtol(&name[i+1], NULL,
-						     10);
-				yres_specified = 1;
-			} else
-				goto done;
-			break;
-		case '0' ... '9':
-			break;
-		default:
-			goto done;
-		}
-	}
-	if (i < 0 && yres_specified) {
-		xres = simple_strtol(name, NULL, 10);
-		res_specified = 1;
-	}
-done:
-	if (res_specified)
-		var->xres = 32*((xres - 1)/32 + 1);
-
-	if (yres_specified)
-		var->yres = 16*((yres - 1)/16 + 1);
-
-	if (refresh_specified) {
-		var->pixclock = refresh_to_pixclock(refresh, var);
-	}
-
-	printk(KERN_ALERT DRIVER_NAME "Setting mode %d x %d @ %d (%d) Hz \n",
-	       var->xres, var->yres, refresh, hub12fb_refresh_rate(var));
-
-	return 0;
-}
 
 /**
  *      hub12fb_check_var - Validates a var passed in.
@@ -557,10 +556,14 @@ static int hub12fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info
 	var->left_margin  = 0;
 	var->right_margin = 0;
 
-	var->bits_per_pixel = 1;  /* future, allow 8 bit gray */
+	if (var->bits_per_pixel > 1)
+		var->bits_per_pixel = 8;
+	else
+		var->bits_per_pixel = 1;
 
 	var->vmode = FB_VMODE_NONINTERLACED;
 
+	/* in future, allow longer length palette in 8 bit mode */
 	switch (var->bits_per_pixel) {
 		case 1:
 			var->red.offset = 0;
@@ -574,11 +577,11 @@ static int hub12fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info
 			break;
 		case 8:
 			var->red.offset = 0;
-			var->red.length = 8;
+			var->red.length = 1;
 			var->green.offset = 0;
-			var->green.length = 8;
+			var->green.length = 1;
 			var->blue.offset = 0;
-			var->blue.length = 8;
+			var->blue.length = 1;
 			var->transp.offset = 0;
 			var->transp.length = 0;
 			break;
@@ -603,60 +606,75 @@ static void hub12fb_free_buffers(struct hub12_par *par)
 	/* stop running the kernel refresh thread before this! */
 	hub12fb_stop_running(par);
 
+	if (!device->coherent_dma_mask)
+		device = NULL;
+
 	for (i=0; i<4; i++) {
 		if (par->hsync_dma[i])
 			dma_free_attrs(device, par->hsync_length, par->hsync_buf[i],
 				       par->hsync_dma[i], &attrs);
-		else if (par->hsync_buf[i])
-			kfree(par->hsync_buf[i]);
 
 		par->hsync_buf[i] = NULL;
 		par->hsync_dma[i] = 0;
 	}
 
 	if (par->fb_buffer) {
-		kfree(par->fb_buffer);
+		free_pages_exact(par->fb_buffer, par->bsize);
 		par->fb_buffer = NULL;
 	}
 }
 
-static int hub12fb_allocate_buffers(struct hub12_par *par)
-{
+static int hub12fb_allocate_buffers(struct fb_info *info){
+	struct hub12_par *par = info->par;
+	struct fb_fix_screeninfo *fix = &info->fix;
 	int i;
-	size_t bsize;
 	struct device *device = &par->spi->dev;
 	DEFINE_DMA_ATTRS(attrs);
 	dma_addr_t dma_handle = 0;
+	int good_dma_mask = 1;
 	void *p;
-	int use_dma = 1;
-
-	bsize = (par->pdata.width/8) * par->pdata.height;
-
-	par->fb_buffer = kzalloc(bsize, GFP_KERNEL);
-
-	if (!par->fb_buffer)
-		return -ENOMEM;
-
-	par->hsync_length = bsize/4;
 
 	if (!device->coherent_dma_mask) {
-		printk(KERN_ALERT DRIVER_NAME
-		       " can't allocate DMA buffer.\n");
-		printk(KERN_ALERT
-		       "spi driver (master) coherent_dma_masks %llx (%llx)\n",
-		       device->coherent_dma_mask,
-		       par->spi->master->dev.coherent_dma_mask);
-		use_dma = 0;
-	} else
-		/* get dma memory if available */
-		dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
+		printk(KERN_ALERT DRIVER_NAME " should set device coherent_dma_mask."
+			" Driver (Master) masks %llx (%llx)\n", device->coherent_dma_mask,
+			par->spi->master->dev.coherent_dma_mask);
+		good_dma_mask = 0;
+	}
+
+	if (!good_dma_mask)
+		device = NULL;
+
+	dma_set_attr(DMA_ATTR_WRITE_COMBINE, &attrs);
+
+	fix->line_length = (par->pdata.width * par->pdata.bpp + 7) / 8;
+
+	//par->bsize = ((par->pdata.height * fix->line_length)/PAGE_SIZE + 1) * PAGE_SIZE;
+	par->bsize = PAGE_ALIGN(par->pdata.height * fix->line_length);
+
+	/* page aligned memory of at least bsize length */
+	p = alloc_pages_exact(par->bsize, GFP_DMA | __GFP_ZERO);
+	if (!p)
+		return -ENOMEM;
+
+	memset(p,0,par->bsize);
+
+	/* set buffers now to fb device */
+	par->fb_buffer    = p;
+	info->screen_base = p;
+
+	fix->smem_start   = (unsigned long) p;
+	//fix->smem_start   = virt_to_phys(p);
+	fix->smem_len     = par->bsize;
+
+	/* Report alloc memory info! */
+	printk("framebuffer: kernel=0x%p, smem=0x%p, len=0x%x\n",
+		p, (void *)fix->smem_start, fix->smem_len);
+
+	par->hsync_length = (par->pdata.width/8) * par->pdata.height / 4;
 
 	for (i=0; i<4; i++) {
-		if (use_dma)
-			p = dma_alloc_attrs(device, par->hsync_length,
-					    &dma_handle, GFP_KERNEL, &attrs);
-		else
-			p = kmalloc(par->hsync_length, GFP_KERNEL);
+		p = dma_alloc_attrs(device, par->hsync_length,
+				    &dma_handle, GFP_KERNEL, &attrs);
 
 		if (!p)
 			goto cleanup_buffers;
@@ -693,53 +711,54 @@ cleanup_buffers:
  */
 static int hub12fb_set_par(struct fb_info *info)
 {
-	int retval;
+	int retval=0;
 	struct hub12_par *par = info->par;
 	struct fb_fix_screeninfo *fix = &info->fix;
+	struct fb_var_screeninfo *var = &info->var;
 
 	/* before we do anything... lets stop the current framebuffer */
 
 	hub12fb_stop_running(info->par);
-
-	par->pdata.width  = info->var.xres;
-	par->pdata.height = info->var.yres;
-
-	/* clear old buffers */
-	if (par->fb_buffer)
+	/* clear old buffers if size or depth change */
+	if (par->fb_buffer && ( par->pdata.width  != var->xres ||
+				par->pdata.height != var->yres ||
+				par->pdata.bpp    != var->bits_per_pixel ))
 		hub12fb_free_buffers(par);
 
-	retval = hub12fb_allocate_buffers(par);
+	par->pdata.width  = var->xres;
+	par->pdata.height = var->yres;
+	par->pdata.bpp    = var->bits_per_pixel;
 
-	/* test pattern */
-	if (par->pdata.width == 32 && par->pdata.height == 16)
-		memcpy(par->fb_buffer, test_pattern_32_16, 64);
+	if (par->fb_buffer == NULL)
+		retval = hub12fb_allocate_buffers(info);
 
 	if (retval) {
 		dev_err(&par->spi->dev, "Unable to allocate buffers.");
 		return retval;
 	}
 
-	/* set buffers now to fb device */
-	info->screen_base = par->fb_buffer;
-	fix->smem_start = (unsigned long) par->fb_buffer;
-	fix->smem_len = par->pdata.width * par->pdata.height / 8;
-
 	/* set fix based on var */
-	fix->line_length = par->pdata.width / 8;
+	if (var->bits_per_pixel == 1)
+		fix->visual = FB_VISUAL_MONO10;
+	else
+		fix->visual = FB_VISUAL_STATIC_PSEUDOCOLOR;
+
 
 	/* set timings */
 	par->hsync_period = ns_to_ktime((NSEC_PER_SEC /
 					 hub12fb_refresh_rate(&info->var))/4);
-	par->vsync_timeout = (2 * HZ) / hub12fb_refresh_rate(&info->var);
+
+	par->hsync_timeout = (HZ/4) / hub12fb_refresh_rate(&info->var) + 1;
+
 	hub12fb_set_brightness(par);
 
 	printk(KERN_ALERT DRIVER_NAME
-	       " timings (usec) hsync: %lld, led: %lld, vsync timeout: %ld\n",
+	       " timings (usec) hsync: %lld, led: %lld, hsync timeout: %ld\n",
 	       ktime_to_us(par->hsync_period),
 	       ktime_to_us(par->ledon_period),
-	       (long) jiffies_to_usecs(par->vsync_timeout));
+	       (long) jiffies_to_usecs(par->hsync_timeout));
 
-	info->flags = FBINFO_DEFAULT;
+	info->flags = hub12fb_info_flags;
 
 	if (par->blank == FB_BLANK_UNBLANK)
 		hub12fb_start_running(par);
@@ -778,30 +797,103 @@ static int hub12fb_blank(int blank_mode, struct fb_info *info)
 	return 0;
 }
 
-    /*
-     *  Frame buffer operations
-     */
+/*
+ *  Frame buffer operations
+*/
 
 static struct fb_ops hub12fb_ops = {
 	.owner		= THIS_MODULE,
 	.fb_check_var	= hub12fb_check_var,
 	.fb_set_par	= hub12fb_set_par,
 	.fb_blank	= hub12fb_blank,
-	/* use this if no reversed pixels
+	.fb_read	= fb_sys_read,
+	.fb_write	= fb_sys_write,
 	.fb_fillrect	= sys_fillrect,
 	.fb_copyarea	= sys_copyarea,
 	.fb_imageblit	= sys_imageblit,
-	 */
-	.fb_fillrect	= cfb_fillrect,
-	.fb_copyarea	= cfb_copyarea,
-	.fb_imageblit	= cfb_imageblit,
 };
 
-/* ------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+ *  Initialization
+ */
 
-    /*
-     *  Initialization
-     */
+static int hub12fb_modestr_to_info(const char *mode_option, struct fb_info *info)
+{
+	/* parseing section borrowed form modedb.c */
+	struct fb_var_screeninfo *var = &info->var;
+	int i;
+	const char *name;
+	unsigned int namelen;
+	int res_specified = 0, refresh_specified = 0;
+	int yres_specified = 0, bpp_specified = 0;
+	unsigned int xres = 32, yres = 16, refresh = 60, bpp=1;
+
+	if (!mode_option)
+		mode_option = "32x32@60";
+
+	name = mode_option;
+	namelen = strlen(name);
+
+	for (i = namelen-1; i >= 0; i--) {
+		switch (name[i]) {
+		case '@':
+			namelen = i;
+			if (!refresh_specified && !yres_specified) {
+				refresh = simple_strtol(&name[i+1], NULL,
+							10);
+				refresh_specified = 1;
+			} else
+				goto done;
+			break;
+		case '-':
+			namelen = i;
+			if (!bpp_specified && !yres_specified) {
+				bpp = simple_strtol(&name[i+1], NULL,
+						    10);
+				bpp_specified = 1;
+			} else
+				goto done;
+			break;
+		case 'x':
+			if (!yres_specified) {
+				yres = simple_strtol(&name[i+1], NULL,
+						     10);
+				yres_specified = 1;
+			} else
+				goto done;
+			break;
+		case '0' ... '9':
+			break;
+		default:
+			goto done;
+		}
+	}
+	if (i < 0 && yres_specified) {
+		xres = simple_strtol(name, NULL, 10);
+		res_specified = 1;
+	}
+done:
+	if (res_specified)
+		var->xres = 32*((xres - 1)/32 + 1);
+
+	if (yres_specified)
+		var->yres = 16*((yres - 1)/16 + 1);
+
+	if (refresh_specified) {
+		var->pixclock = refresh_to_pixclock(refresh, var);
+	}
+
+	if (bpp_specified)
+		var->bits_per_pixel = bpp;
+
+	hub12fb_check_var(var, info);
+
+	printk(KERN_ALERT DRIVER_NAME " setting mode %dx%d-%d@%dHz.\n",
+	       var->xres, var->yres, var->bits_per_pixel, hub12fb_refresh_rate(var));
+
+	return 0;
+}
+
 
 static int __devinit hub12fb_probe (struct spi_device *spidev)
 {
@@ -834,7 +926,8 @@ static int __devinit hub12fb_probe (struct spi_device *spidev)
 	fix = &info->fix;
 
 	/* keep a copy in the parameters */
-	memcpy(&par->pdata, spidev->dev.platform_data, sizeof(struct hub12fb_platform_data));
+	memcpy(&par->pdata, spidev->dev.platform_data,
+	       sizeof(struct hub12fb_platform_data));
 	pdata = &par->pdata;
 
 	/* lets fill in fb_info */
@@ -878,9 +971,6 @@ static int __devinit hub12fb_probe (struct spi_device *spidev)
 	*/
 
 	/* initialize kernel thread structures in hub12_par */
-
-	init_waitqueue_head(&par->vsync_wait);
-
 	hrtimer_init(&par->hsync_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	par->hsync_timer.function = do_hsync;
 
@@ -891,50 +981,56 @@ static int __devinit hub12fb_probe (struct spi_device *spidev)
 	/* some filling in of fb_var_screeninfo */
 	var->xres 	= par->pdata.width;
 	var->yres 	= par->pdata.height;
+	var->bits_per_pixel = par->pdata.bpp;
 	var->pixclock	= refresh_to_pixclock(par->pdata.refresh, var);
+	var->activate	= FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
 
 	/* lets take care of initial mode override now */
 	if (mode)
-		hub12fb_modestr_to_var(mode, var);
+		hub12fb_modestr_to_info(mode, info);
 
-	/* possibly need this? */
 	/*
-	 *  var->nonstd		= FB_NONSTD_REV_PIX_IN_B;
-	 */
+	if (fb_alloc_cmap(&info->cmap, 256, 0)) {
+		retval = -ENOMEM;
+		goto probe_fail_free_bl;
+	}
+	*/
+
+	/* static cmap of 2 colors (red and black) */
+	info->cmap = hub12fb_cmap_2_colors;
 
 	info->fbops = &hub12fb_ops;
 	info->flags = FBINFO_FLAG_DEFAULT;
 	info->pseudo_palette = par->pseudo_palette; /* not used */
 
-	hub12fb_check_var(&info->var, info);
-
-	/* does allocation of buffers, and sets thread in motion */
-	retval = hub12fb_set_par(info);
+	/* calls check_var and set_par */
+	retval = fb_set_var(info, &info->var);
 	if (retval)
-		goto probe_fail_free_bl;
-
-	if (fb_alloc_cmap(&info->cmap, 256, 0)) {
-		retval = -ENOMEM;
-		goto probe_fail_free_buffers;
-	}
+		goto probe_fail_free_cmap;
 
 	if (register_framebuffer(info) < 0) {
 		printk(KERN_ERR DRIVER_NAME ": unable to register framebuffer.\n");
 		retval = -EINVAL;
-		goto probe_fail_free_cmap;
+		goto probe_fail_free_buffers;
 	}
+
+	/* this should be done by fb_set var */
+	/*
+	fb_var_to_videomode(&fbmode, &info->var);
+	fb_add_videomode(&fbmode, &info->modelist);
+	*/
 
 	spi_set_drvdata(spidev, info);
 
 	return retval;
 
-probe_fail_free_cmap:
-	fb_dealloc_cmap(&info->cmap);
-
 probe_fail_free_buffers:
 	hub12fb_free_buffers(par);
 
-probe_fail_free_bl:
+probe_fail_free_cmap:
+	/* fb_dealloc_cmap(&info->cmap);*/
+
+/*probe_fail_free_bl: */
 	exit_hub12bl(info);
 
 probe_fail_free_fb:
@@ -955,7 +1051,7 @@ static int __devexit hub12fb_remove(struct spi_device *spidev)
 		hub12fb_stop_running(info->par);
 		unregister_framebuffer(info);
 		spi_set_drvdata(spidev, NULL);
-		fb_dealloc_cmap(&info->cmap);
+		/*fb_dealloc_cmap(&info->cmap);*/
 		exit_hub12bl(info);
 		hub12fb_free_buffers(info->par);
 		/* free gpio ? */
@@ -1052,7 +1148,7 @@ static struct spi_driver hub12fb_driver = {
  * expanding on Scott Ellis's idea https://gist.github.com/scottellis/716613
  *
  * probably should go away, but great for Raspberry Pi or other
- * hackable boards
+ * hackable boards, at least until Device Tables are fully implemented
  *
  */
 static struct spi_device * dynamic_loaded_device = NULL;
@@ -1178,29 +1274,27 @@ static void __exit hub12fb_exit(void)
 	}
 }
 
-/* ------------------------------------------------------------------------- */
-
-
-    /*
-     *  Modularization
-     */
+/* -------------------------------------------------------------------------
+ * Modularization
+ */
 
 module_init(hub12fb_init);
 module_exit(hub12fb_exit);
 
-
 module_param(mode, charp, 0);
 MODULE_PARM_DESC(mode,
-		 "Specify video mode as \"<xres>x<yres>[@<refresh>]\" ");
+	" specify video mode as \"<xres>x<yres>[-<bpp>][@<refresh>]\"");
 
 module_param_array(spi, int, NULL, 0);
-MODULE_PARM_DESC(spi_option,
-		 "Dynamically bind to SPI with spi=<bus>,<cs>,<maxspeed>");
+MODULE_PARM_DESC(spi,
+	" dynamically bind to SPI with spi=<bus>,<cs>,<maxspeed>");
 
 module_param_array(gpio, int, NULL, 0);
-MODULE_PARM_DESC(spi_option,
-		 "Specifiy GPIO connections as gpio=<oe>,<la>,<a>,<b>");
+MODULE_PARM_DESC(gpio,
+		 " specifiy GPIO connections as gpio=<oe>,<la>,<a>,<b>");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Darren Garnier");
+/* covered by spi_register_driver
 MODULE_ALIAS("spi:" HUB12FB_MODALIAS);
+*/
