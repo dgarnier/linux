@@ -65,7 +65,7 @@
 #endif
 
 #ifdef CONFIG_FB_HUB12
-#include <video/hub12fb.h>
+#include <linux/spi/hub12fb.h>
 #endif
 
 
@@ -593,8 +593,9 @@ static struct hub12fb_platform_data hub12fb_pdata = {
 	},
 	.width      = 32,
 	.height     = 32,
+	.bpp        = 8,
 	.refresh    = 60,
-	.brightness = 30,
+	.brightness = 20,
 };
 #endif
 

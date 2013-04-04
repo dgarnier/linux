@@ -27,13 +27,13 @@
 		 .latch  = 17,
 		 .a      = 22,
 		 .b      = 27,
-	 },
-	 .width      = 32,
-	 .height     = 32,
-	 .framerate  = 60,
-	 .brightness = 30,
+	},
+	.width      = 32,
+	.height     = 32,
+	.bpp        = 1,
+	.framerate  = 60,
+	.brightness = 30,
  };
-
 
  static const struct spi_board_info spi_board_info[] __devinitdata = {
 	 [0] = {
@@ -59,6 +59,7 @@ struct hub12fb_platform_data {
 	} gpio;
 	unsigned width;
 	unsigned height;
+	unsigned bpp;
 	unsigned refresh;
 	unsigned brightness;
 };
