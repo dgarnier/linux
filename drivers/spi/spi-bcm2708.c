@@ -181,96 +181,6 @@ static inline void bcm2708_wr(struct bcm2708_spi *bs, unsigned reg, u32 val)
 	writel(val, bs->base + reg);
 }
 
-<<<<<<< HEAD
-static inline void bcm2708_rd_fifo(struct bcm2708_spi *bs, int len)
-{
-	u8 byte;
-
-	while (len--) {
-		byte = bcm2708_rd(bs, SPI_FIFO);
-		if (bs->rx_buf)
-			*bs->rx_buf++ = byte;
-	}
-}
-
-static inline void bcm2708_wr_fifo(struct bcm2708_spi *bs, int len)
-{
-	u8 byte;
-	u16 val;
-
-	if (len > bs->len)
-		len = bs->len;
-
-	if (unlikely(bcm2708_rd(bs, SPI_CS) & SPI_CS_LEN)) {
-		/* LoSSI mode */
-		if (unlikely(len % 2)) {
-			printk(KERN_ERR"bcm2708_wr_fifo: length must be even, skipping.\n");
-			bs->len = 0;
-			return;
-		}
-		while (len) {
-			if (bs->tx_buf) {
-				val = *(const u16 *)bs->tx_buf;
-				bs->tx_buf += 2;
-			} else
-				val = 0;
-			bcm2708_wr(bs, SPI_FIFO, val);
-			bs->len -= 2;
-			len -= 2;
-		}
-		return;
-	}
-
-	while (len--) {
-		byte = bs->tx_buf ? *bs->tx_buf++ : 0;
-		bcm2708_wr(bs, SPI_FIFO, byte);
-		bs->len--;
-	}
-}
-
-static irqreturn_t bcm2708_spi_interrupt(int irq, void *dev_id)
-{
-	struct spi_master *master = dev_id;
-	struct bcm2708_spi *bs = spi_master_get_devdata(master);
-	u32 cs;
-
-	spin_lock(&bs->lock);
-
-	cs = bcm2708_rd(bs, SPI_CS);
-
-	if (cs & SPI_CS_DONE) {
-		if (bs->len) { /* first interrupt in a transfer */
-			/* fill the TX fifo with up to 16 bytes */
-			bcm2708_wr_fifo(bs, 16);
-		} else { /* transfer complete */
-			/* disable interrupts */
-			cs &= ~(SPI_CS_INTR | SPI_CS_INTD);
-			bcm2708_wr(bs, SPI_CS, cs);
-
-			/* drain RX FIFO */
-			while (cs & SPI_CS_RXD) {
-				bcm2708_rd_fifo(bs, 1);
-				cs = bcm2708_rd(bs, SPI_CS);
-			}
-
-			/* wake up our bh */
-			complete(&bs->done);
-		}
-	} else if (cs & SPI_CS_RXR) {
-		/* read 12 bytes of data */
-		bcm2708_rd_fifo(bs, 12);
-
-		/* write up to 12 bytes */
-		bcm2708_wr_fifo(bs, 12);
-	}
-
-	spin_unlock(&bs->lock);
-
-	return IRQ_HANDLED;
-}
-
-=======
->>>>>>> msperl
 static int bcm2708_setup_state(struct spi_master *master,
 			struct device *dev, struct bcm2708_spi_state *state,
 			u32 hz, u8 csel, u8 mode, u8 bpw)
@@ -307,12 +217,8 @@ static int bcm2708_setup_state(struct spi_master *master,
 	switch (bpw) {
 	case 8:
 		break;
-	case 9:
-		/* Reading in LoSSI mode is a special case. See 'BCM2835 ARM Peripherals' datasheet */
-		cs |= SPI_CS_LEN;
-		break;
 	default:
-		dev_dbg(dev, "setup: invalid bits_per_word %u (must be 8 or 9)\n",
+		dev_dbg(dev, "setup: invalid bits_per_word %u (must be 8)\n",
 			bpw);
 		return -EINVAL;
 	}
@@ -336,10 +242,6 @@ static int bcm2708_setup_state(struct spi_master *master,
 	if (state) {
 		state->cs = cs;
 		state->cdiv = cdiv;
-		dev_dbg(dev, "setup: want %d Hz; "
-			"bus_hz=%lu / cdiv=%u == %lu Hz; "
-			"mode %u: cs 0x%08X\n",
-			hz, bus_hz, cdiv, bus_hz/cdiv, mode, cs);
 	}
 
 	return 0;
@@ -375,16 +277,6 @@ static int bcm2708_release_dma(struct platform_device *pdev,
 	return 0;
 }
 
-<<<<<<< HEAD
-	if (xfer->bits_per_word || xfer->speed_hz) {
-		ret = bcm2708_setup_state(spi->master, &spi->dev, &state,
-			xfer->speed_hz ? xfer->speed_hz : spi->max_speed_hz,
-			spi->chip_select, spi->mode,
-			xfer->bits_per_word ? xfer->bits_per_word :
-				spi->bits_per_word);
-		if (ret)
-			return ret;
-=======
 static int bcm2708_register_dmabuffer(struct platform_device *pdev,
 				struct bcm2708_spi * bs) {
 	/* for this to work you need to have set the following:
@@ -408,7 +300,6 @@ static int bcm2708_register_dmabuffer(struct platform_device *pdev,
         }
 	return 0;
 }
->>>>>>> msperl
 
 static int bcm2708_release_dmabuffer(struct platform_device *pdev,
 				struct bcm2708_spi * bs) {
@@ -848,7 +739,6 @@ static int bcm2708_spi_setup(struct spi_device *spi)
 	if (ret < 0) {
 		kfree(state);
 		spi->controller_state = NULL;
-                return ret;
 	}
 	
 	dev_dbg(&spi->dev,
